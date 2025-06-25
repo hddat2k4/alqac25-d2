@@ -1,0 +1,13 @@
+# Bỏ qua toàn bộ thư mục
+data/
+finetune_data/
+additional_data/zalo
+
+# Bỏ qua file zip lớn
+ALQAC_2025_data.zip
+
+# Bỏ qua cache
+__pycache__/
+*.pyc
+
+test.ipynb
