@@ -1,7 +1,8 @@
 # Bỏ qua toàn bộ thư mục
+.gitignore
 data/
 finetune_data/
-additional_data/zalo
+additional_data/
 
 # Bỏ qua file zip lớn
 ALQAC_2025_data.zip
