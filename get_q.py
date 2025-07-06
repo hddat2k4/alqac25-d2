@@ -12,16 +12,8 @@ with open("./vietnamese-stopwords.txt", "r", encoding="utf-8") as f:
 
 
 
+# Lọc bỏ các lựa chọn meta như 'Cả A, B, C đều đúng', 'Tất cả các ý trên', v.v.
 def remove_meta_choices(choices):
-    """
-    Lọc bỏ các lựa chọn meta như 'Cả A, B, C đều đúng', 'Tất cả các ý trên', v.v.
-    
-    Args:
-        choices (List[str]): Danh sách các lựa chọn (chuỗi)
-
-    Returns:
-        List[str]: Danh sách chỉ chứa các lựa chọn có nội dung cụ thể
-    """
     meta_patterns = [
         r"cả\s*(3|ba)?\s*(phương án|đáp án)?\s*(a|b|c|d)(,?\s*(a|b|c|d))*\s*(và\s*(a|b|c|d))?\s*(đều\s*)?(đúng|sai)?\.?$",
         r"cả\s*(a|b|c|d)\s*và\s*(a|b|c|d)\s*(là\s*)?(đúng|sai)?\.?$",
@@ -43,8 +35,10 @@ def remove_meta_choices(choices):
         result.append(choices[idx])
     return result
 
+
+
+# Xoá cụm như "đúng hay sai?", "đúng hoặc sai.", "sai hoặc đúng?", ... ở cuối câu
 def clean_yesno_question(question):
-    # Xoá cụm như "đúng hay sai?", "đúng hoặc sai.", "sai hoặc đúng?", ... ở cuối câu
     return re.sub(r'\s*(đúng|sai)\s*(hoặc|hay)?\s*(đúng|sai)?[.?\s]*$', '', question.strip(), flags=re.IGNORECASE)
 
 def expand_query_with_rm3(top_docs, original_query, stopwords, top_n=8):
@@ -58,6 +52,7 @@ def expand_query_with_rm3(top_docs, original_query, stopwords, top_n=8):
     term_counts = Counter(all_tokens)
     top_terms = [term for term, _ in term_counts.most_common(top_n)]
     return original_query.strip() + " " + " ".join(top_terms)
+
 
 def pre_processing(text):
     text = text.replace("\n", " ")
