@@ -1,5 +1,6 @@
 import json
 import re
+import math
 from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
@@ -14,8 +15,10 @@ from weaviate.classes.config import (
 from langchain.embeddings.base import Embeddings
 from sentence_transformers.cross_encoder import CrossEncoder
 import time
+from dotenv import load_dotenv
 import os
 
+load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
 
 ### Rechunking Utilities
@@ -25,35 +28,45 @@ def load_json(file_path):
     return data
 
 def get_article_length(article):
-    words = re.findall(r'\w+', article)  # Đếm đúng cả từ và số
+    words = re.findall(r'\w+', article)
     return len(words)
 
 def split_article(article_text, threshold):
-    # Bước 1: Tách khoản theo regex
-    # Mẫu regex tìm các khoản bắt đầu bằng số + dấu chấm + khoảng trắng (ví dụ: "1. ", "2. ", ...)
+    """
+    Splits an article into chunks based on clauses and word count threshold.
+    
+    Args:
+        article_text (str): The article text to split
+        threshold (int): Maximum words per chunk
+        
+    Returns:
+        list: List of article chunks
+    """
+    # === Step 1: Split clauses using regex
+    # Regex pattern to find clauses starting with number + dot + space (e.g., "1. ", "2. ", ...)
     clause_pattern = r'(\d+\.\s.*?)((?=\n\s*\d+\.\s)|$)'
     clauses = re.split(clause_pattern, article_text)
     clauses = [clause.strip() for clause in clauses if clause.strip()]  # Xóa khoảng trắng thừa
     
-    # Nếu tổng số từ không vượt threshold thì giữ nguyên
+    # If total words doesn't exceed threshold, keep original
     total_words = get_article_length(article_text)
     if total_words <= threshold or len(clauses) == 1:
         return [article_text]
         
-    # Bước 2: Tính số chunk cần có
-    n_chunks = int(total_words / threshold) + 1
+    # === Step 2: Calculate required number of chunks
+    n_chunks = math.ceil(total_words / threshold)
 
     target_words_per_chunk = total_words / n_chunks
 
     merged_chunks = []
-    current_chunk = clauses[0]  # Bắt đầu với clause đầu tiên
+    current_chunk = clauses[0]  # Start with first clause
     current_word_count = 0
     chunk_count = 0
 
     for clause in clauses[1:]:
         clause_word_count = get_article_length(clause)
 
-        # Nếu là chunk cuối cùng thì gom hết
+        # If this is the last chunk, merge everything remaining
         if chunk_count == n_chunks - 1:
             if current_chunk:
                 current_chunk += '\n' + clause
@@ -61,7 +74,7 @@ def split_article(article_text, threshold):
                 current_chunk = clause
             continue
 
-        # Nếu cộng thêm clause vẫn dưới ngưỡng → thêm vào chunk hiện tại
+        # If adding clause still under threshold → add to current chunk
         if current_word_count + clause_word_count <= target_words_per_chunk:
             if current_chunk:
                 current_chunk += '\n' + clause
@@ -69,30 +82,47 @@ def split_article(article_text, threshold):
                 current_chunk = clause
             current_word_count += clause_word_count
         else:
-            # Đóng chunk hiện tại nếu không rỗng
+            # Close current chunk if not empty
             if current_chunk:
                 merged_chunks.append(current_chunk.strip())
                 chunk_count += 1
-            # Bắt đầu chunk mới với clause này
+            # Start new chunk with this clause
             current_chunk = clause
             current_word_count = clause_word_count
 
-    # Thêm phần còn lại vào chunk cuối
+    # Add remaining content to final chunk
     if current_chunk:
         merged_chunks.append(current_chunk.strip())
 
     return merged_chunks
 
-def rechunk_data(data, threshold):
+def rechunk_data(data, threshold, output_file):
+    """
+    Rechunks legal data by splitting articles that exceed word threshold.
+    
+    Args:
+        data (list): List of laws, each containing articles
+        threshold (int): Maximum word count per chunk
+        output_file (str): Path to save rechunked data
+        
+    Returns:
+        list: Rechunked data with split articles
+    """
+
+    # Initialize container for rechunked results
     rechunked_data = []
+    
+    # Process each law in the dataset
     for item in data:
-        rechunked_law = []
+        rechunked_law = [] # Container for current law's rechunked articles
         for article in item['articles']:
+            # Split article text into chunks based on threshold
             chunks = split_article(article['text'], threshold)
+            # Create separate entries for each chunk
             for i, chunk in enumerate(chunks):
                 rechunked_law.append({
                     'id': article['id'],
-                    'split': i,
+                    'split': i, # Add split index (0, 1, 2, ...)
                     'text': chunk
                 })
         rechunked_data.append({
@@ -100,10 +130,46 @@ def rechunk_data(data, threshold):
             'articles': rechunked_law
         })
     print(f"Rechunked {len(data)} laws into {sum(len(law['articles']) for law in rechunked_data)} chunks.")
+
+    # Save rechunked data to output file
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(rechunked_data, f, ensure_ascii=False, indent=4)
+    print(f"✅ Rechunked data saved to {output_file}")
+
     return rechunked_data
 
 ### Embedding Utilities
 def data_to_dict(data):
+    """
+    Converts a nested legal dataset into a flat list of dictionaries, 
+    each containing the text content of an article and its associated metadata.
+
+    Args:
+        data (list): A list of dictionaries, where each dictionary represents a legal document
+                     with the structure:
+                     {
+                         "id": <law_id>,
+                         "articles": [
+                             {
+                                 "id": <article_id>,
+                                 "split": <section_name_or_type>,
+                                 "text": <article_text>
+                             },
+                             ...
+                         ]
+                     }
+
+    Returns:
+        list: A flattened list of dictionaries in the format:
+              {
+                  "page_content": <article_text>,
+                  "metadata": {
+                      "law_id": <law_id>,
+                      "article_id": <article_id>,
+                      "split": <section_name_or_type>
+                  }
+              }
+    """
     data_dict = []
 
     for item in data:
@@ -123,56 +189,75 @@ def data_to_dict(data):
 
     return data_dict
 
-def embed_data(data, model_name="AITeamVN/Vietnamee_Embedding", batch_size=32):
 
-    # Check if GPU (CUDA) is available and set device accordingly
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def embed_data(data, model_name="AITeamVN/Vietnamese_Embedding", batch_size=16, output_file=None):
+    """
+    Generates vector embeddings for a list of input documents using a specified SentenceTransformer model.
+    Embeddings are computed in batches, assigned back to the original data, and saved to a file.
+
+    Args:
+        data (list): A list of dictionaries, each containing 'page_content' (text) and 'metadata'.
+        model_name (str): The name or path of the SentenceTransformer model to be used for embedding.
+        batch_size (int): Number of items to process per batch. Smaller values reduce GPU memory usage.
+        output_file (str): Optional. Path to the output JSON file where embedded data will be saved.
+
+    Returns:
+        list: The input data with an additional 'embedding' field added to each item.
+    """
+    # Force CUDA GPU usage and check specific GPU
+    if torch.cuda.is_available():
+        device = "cuda:0"  # Explicitly use first CUDA GPU
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+    else:
+        device = "cpu"
+        print("CUDA not available, using CPU")
+    
     print(f"Using device: {device}")
-
-    # Load the SentenceTransformer model and move it to the selected device
-    model = SentenceTransformer(model_name, device=device)
+    
+    # Load model với device explicit
+    model = SentenceTransformer(
+        model_name, 
+        token=hf_token, 
+        trust_remote_code=True,
+        device=device
+    )
     model.max_seq_length = 2048
-
-    batch_size = 32
-    texts = []
-    items = []
-
-    # Loop over the data and prepare text inputs
-    for item in data:
-        text = f"{item['metadata']['law_id']} {item['page_content']}"
-        texts.append(text)
-        items.append(item)
-
-        # If batch is full, compute embeddings
-        if len(texts) == batch_size:
-            embeddings = model.encode(
-                texts,
-                batch_size=batch_size,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                device=device  # Ensure encoding is done on GPU
-            )
-            # Assign computed embeddings back to original items
-            for i, emb in enumerate(embeddings):
-                items[i]['embedding'] = emb.tolist()
-            texts = []
-            items = []
-
-    # Process remaining texts if total number is not divisible by batch_size
-    if texts:
+    
+    # Verify model is on GPU
+    print(f"Model device: {next(model.parameters()).device}")
+    
+    # Process in smaller batches to avoid memory issues
+    batch_size = min(batch_size, 16)  # Reduce batch size
+    
+    for i in tqdm(range(0, len(data), batch_size), desc="Processing batches"):
+        batch_items = data[i:i+batch_size]
+        texts = [f"{item['metadata']['law_id']} {item['page_content']}" 
+                for item in batch_items]
+        
+        # Clear GPU cache before processing
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+        
         embeddings = model.encode(
             texts,
-            batch_size=batch_size,
+            batch_size=len(texts),  # Process all texts in batch at once
             convert_to_numpy=True,
             normalize_embeddings=True,
-            device=device  # Ensure encoding is done on GPU
+            show_progress_bar=False
         )
-        for i, emb in enumerate(embeddings):
-            items[i]['embedding'] = emb.tolist()
-
-    print(f"Embedded {len(data)} items into {len(items)} embeddings.")
-
-    return data
+        
+        # Assign embeddings
+        for j, emb in enumerate(embeddings):
+            batch_items[j]['embedding'] = emb.tolist()
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    print(f"✅ Embeddings saved to {output_file}")
+    
+    return data    
 
 ### Weaviate Utilities
 def create_hybrid_collection(name):
@@ -273,7 +358,7 @@ def pre_processing(text):
     return " ".join(text.split())
 
 class CustomSentenceTransformerEmbeddings(Embeddings):
-    def __init__(self, model_id='AITeamVN/Vietnamee_Embedding'):
+    def __init__(self, model_id='AITeamVN/Vietnamese_Embedding'):
         self.model = SentenceTransformer(model_id, token=hf_token, trust_remote_code=True)
 
     def embed_documents(self, texts):
@@ -380,17 +465,17 @@ def rerank(candidate_file: str,
            output_file: str,
            threshold_mode: str, 
            threshold_value: float,
-           batch_size: int = 128):
+           batch_size: int = 12): 
     """
     Reranks retrieved candidates using a cross-encoder model and applies threshold-based filtering.
+    Processes each question individually with its candidates in parallel.
 
     Args:
         candidate_file (str): Path to file containing retrieved candidate documents.
-        ground_truth_file (str): Path to ground truth data (used for potential evaluation).
         output_file (str): File to write final filtered results.
         threshold_mode (str): Either "hard" or "dynamic" to determine filtering strategy.
         threshold_value (float): Threshold value used for filtering.
-        batch_size (int): Batch size for reranking using GPU acceleration.
+        batch_size (int): Batch size for processing candidates per question (default: 12).
     """
 
     print("Loading Cross-Encoder model for reranking...")
@@ -401,63 +486,48 @@ def rerank(candidate_file: str,
 
     # Load input data
     candidate_data = load_json(candidate_file)
+    print(f"Total questions to process: {len(candidate_data)}")
 
-    # === STEP 1: Prepare all (query, candidate) pairs ===
-    print("Preparing sentence pairs for batch processing...")
-    all_sentence_pairs = []
-    processing_info = []
-
-    for item in candidate_data:
+    # Process each question individually
+    final_results = []
+    
+    for epoch, item in enumerate(tqdm(candidate_data, desc="Processing questions"), 1):
         query = item["text"]
         candidates = item["retrieved_candidates"]
-        processing_info.append({"item_data": item, "num_candidates": len(candidates)})
-
-        if candidates:
-            # Create all query-document pairs
-            pairs = [(query, cand["page_content"]) for cand in candidates]
-            all_sentence_pairs.extend(pairs)
-    
-    print(f"Total sentence pairs to rerank: {len(all_sentence_pairs)}")
-
-    # === STEP 2: Run reranking in batches to utilize GPU efficiently ===
-    print("Starting batched reranking...")
-    start_time = time.time()
-    all_rerank_scores = reranker_model.predict(
-        all_sentence_pairs,
-        batch_size=batch_size,
-        show_progress_bar=True
-    )
-    end_time = time.time()
-    print(f"✅ Reranking completed in {end_time - start_time:.2f} seconds.")
-
-    # === STEP 3: Assign rerank scores back to candidates and apply filtering ===
-    print("Processing reranked results and applying filtering...")
-    final_results = []
-    current_score_index = 0
-
-    for info in tqdm(processing_info, desc="Post-processing rerank results"):
-        item_data = info["item_data"]
-        num_candidates = info["num_candidates"]
-
-        if num_candidates == 0:
+        
+        print(f"\nEpoch {epoch}/{len(candidate_data)} - Question ID: {item['question_id']}")
+        print(f"Number of candidates: {len(candidates)}")
+        
+        if not candidates:
             final_results.append({
-                "question_id": item_data["question_id"],
-                "text": item_data["text"],
-                "retrieved_articles": []
+                "question_id": item["question_id"],
+                "text": item["text"],
+                "relevant_articles": []
             })
             continue
 
-        # Slice scores for current query
-        item_scores = all_rerank_scores[current_score_index : current_score_index + num_candidates]
-        current_score_index += num_candidates
+        # === Step 1: Prepare sentence pairs for current question ===
+        sentence_pairs = [(query, cand["page_content"]) for cand in candidates]
+        
+        # === Step 2: Run reranking for this question's candidates ===
+        start_time = time.time()
+        rerank_scores = reranker_model.predict(
+            sentence_pairs,
+            batch_size=min(batch_size, len(sentence_pairs)),  # Use actual number of candidates or batch_size
+            show_progress_bar=False  # Disable inner progress bar since we have outer one
+        )
+        end_time = time.time()
+        print(f"Reranking completed in {end_time - start_time:.3f} seconds")
 
-        candidates = item_data["retrieved_candidates"]
+        # === Step 3: Assign scores and apply filtering ===
         # Assign rerank score to each candidate
         for i, cand in enumerate(candidates):
-            cand['rerank_score'] = float(item_scores[i])
+            cand['rerank_score'] = float(rerank_scores[i])
 
         # Sort candidates by rerank score (descending)
         candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+        
+        print(f"Top score: {candidates[0]['rerank_score']:.4f}, Lowest score: {candidates[-1]['rerank_score']:.4f}")
 
         # Filter based on threshold strategy
         filtered_articles = []
@@ -465,9 +535,11 @@ def rerank(candidate_file: str,
             if threshold_mode == "dynamic":
                 # Dynamic threshold is a percentage of the top score
                 threshold = candidates[0]['rerank_score'] * threshold_value
+                print(f"Dynamic threshold: {threshold:.4f}")
             elif threshold_mode == "hard":
                 # Hard threshold is a fixed score
                 threshold = threshold_value
+                print(f"Hard threshold: {threshold}")
             else:
                 raise ValueError(f"Invalid threshold_mode: {threshold_mode}")
 
@@ -485,14 +557,27 @@ def rerank(candidate_file: str,
                 "article_id": c["article_id"]
             } for c in candidates]
 
+        print(f"Filtered articles: {len(filtered_articles)}/{len(candidates)}")
+
         # Append final result for this question
         final_results.append({
-            "question_id": item_data["question_id"],
+            "question_id": item["question_id"],
             "relevant_articles": filtered_articles,
         })
 
-    # === STEP 4: Save results to file ===
+        # Clear GPU cache after each question to prevent memory buildup
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+
+    # === Step 4: Save results to file ===
     with open(output_file, "w", encoding="utf8") as f:
         json.dump(final_results, f, ensure_ascii=False, indent=4)
 
     print(f"\n✅ Final results saved to: {output_file}")
+    print(f"Processed {len(final_results)} questions total")
+    
+    # Summary statistics
+    total_articles = sum(len(result["relevant_articles"]) for result in final_results)
+    avg_articles = total_articles / len(final_results) if final_results else 0
+    print(f"Total relevant articles: {total_articles}")
+    print(f"Average articles per question: {avg_articles:.2f}")
