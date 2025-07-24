@@ -1,8 +1,6 @@
-import json
-import re
-import math
+import json, re, math, torch, os, time
+from difflib import SequenceMatcher
 from sentence_transformers import SentenceTransformer
-import torch
 from tqdm import tqdm
 import weaviate
 import weaviate.classes as wvc
@@ -13,10 +11,8 @@ from weaviate.classes.config import (
     VectorDistances, 
 )
 from langchain.embeddings.base import Embeddings
-from sentence_transformers.cross_encoder import CrossEncoder
-import time
 from dotenv import load_dotenv
-import os
+
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
@@ -95,6 +91,55 @@ def split_article(article_text, threshold):
         merged_chunks.append(current_chunk.strip())
 
     return merged_chunks
+
+
+def split_clause(text):
+    split_law = re.split(r'\n(?=\d+\.)', text)
+    split_law = [s.strip() for s in split_law if s.strip()]
+    return split_law
+
+def chunk_clause(data, output_file):
+    """
+    Splits articles in legal data into smaller chunks based on clauses.
+    
+    Args:
+        data (list): List of laws, each containing articles
+        output_file (str): Path to save chunked data
+        
+    Returns:
+        list: Chunked data with split articles
+    """
+    
+    # Initialize container for chunked results
+    chunked_data = []
+    
+    # Process each law in the dataset
+    for item in data:
+        chunked_law = []  # Container for current law's chunked articles
+        for article in item['articles']:
+            # Split article text into chunks based on clauses
+            chunks = split_clause(article['text'])
+            # Create separate entries for each chunk
+            for i, chunk in enumerate(chunks):
+                chunked_law.append({
+                    'id': article['id'],
+                    'split': i,  # Add split index (0, 1, 2, ...)
+                    'text': chunk
+                })
+        chunked_data.append({
+            'id': item['id'],
+            'articles': chunked_law
+        })
+    
+    print(f"Chunked {len(data)} laws into {sum(len(law['articles']) for law in chunked_data)} chunks.")
+
+    # Save chunked data to output file
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(chunked_data, f, ensure_ascii=False, indent=4)
+    print(f"✅ Chunked data saved to {output_file}")
+
+    return chunked_data
+
 
 def rechunk_data(data, threshold, output_file):
     """
@@ -366,7 +411,8 @@ class CustomSentenceTransformerEmbeddings(Embeddings):
 
     def embed_query(self, text):
         return self.model.encode([text], convert_to_numpy=True, normalize_embeddings=True)[0].tolist()
-    
+
+
 def retrieve(input_file: str, 
              output_file: str,
              name: str,
@@ -581,3 +627,65 @@ def rerank(candidate_file: str,
     avg_articles = total_articles / len(final_results) if final_results else 0
     print(f"Total relevant articles: {total_articles}")
     print(f"Average articles per question: {avg_articles:.2f}")
+
+
+def get_json(data):
+    if isinstance(data, list):
+        data = ''.join(data)
+
+    # Tìm phần sau ### Kết quả: rồi lấy giá trị "query"
+    match = re.search(r'### Kết quả:.*?"query"\s*:\s*"([^"]+)"', data, re.DOTALL)
+    if match:
+        return match.group(1)
+    else:
+        print("❌ Không tìm thấy trường 'query' sau phần Kết quả.")
+        return None
+    
+rule_map = {
+    r'\bcó quyền\b': 'có thẩm quyền',
+    r'\bai \b': 'chủ thể',
+    r'\báp dụng [^\s]+\s+luật\b': 'hiệu lực thi hành của luật',
+    r'\bcó bị xử phạt không nếu\b': 'quy định xử phạt trong trường hợp',
+    r'\bcó thể[^,\.!?]* xử phạt\b': 'thẩm quyền xử phạt',
+    r'\bđược phép[^,\.!?]* nếu\b': 'trường hợp được phép theo quy định',
+    r'\bcó bắt buộc phải\b': 'trách nhiệm bắt buộc theo quy định',
+    r'\blà gì\??': 'định nghĩa pháp lý của',
+    r'\bthuộc quyền [^?]* nào\??': 'thẩm quyền quản lý',
+    r'\bđược thực hiện như thế nào\??': 'trình tự, thủ tục thực hiện',
+    r'\bcó thời hạn bao lâu\??': 'thời hạn theo quy định',
+    r'\bthực hiện [^,\.!?]* khi nào\b': 'thời điểm thực hiện theo quy định',
+    r'\bđược coi là\b': 'khái niệm pháp lý của',
+}
+
+def apply_rules_with_overlap(text, rules):
+    # Collect all matches with positions and replacement text
+    matches = []
+    for pattern, replacement in rules.items():
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            start, end = match.span()
+            matches.append((start, end, replacement))
+
+    # Sort matches and eliminate overlaps
+    matches.sort()
+    non_overlapping = []
+    last_end = -1
+    for start, end, replacement in matches:
+        if start >= last_end:
+            non_overlapping.append((start, end, replacement))
+            last_end = end
+
+    # Apply replacements in reverse order to preserve indexes
+    for start, end, replacement in reversed(non_overlapping):
+        text = text[:start] + replacement + text[end:]
+
+    return text
+
+def normalize(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
